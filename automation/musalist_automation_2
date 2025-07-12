@@ -640,7 +640,7 @@ class MusalistAutomation:
                         description = description
                         # Inject HTML into the iframe's body
                         await frame.evaluate("(html) => document.body.innerHTML = html", description)
-                        time.sleep(50000)
+                        time.sleep(5)
 
                         self.logger.info("Description filled in iframe")
 
