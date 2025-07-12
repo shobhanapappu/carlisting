@@ -1,0 +1,1140 @@
+import asyncio
+import os
+import time
+import logging
+from playwright.async_api import async_playwright, Page, Browser
+from typing import Dict, List, Optional
+import json
+from datetime import datetime, timedelta
+
+from config import Config
+from utils.encryption import CredentialManager
+
+class MusalistAutomation:
+    def __init__(self):
+        self.browser: Optional[Browser] = None
+        self.power_page: Optional[Page] = None
+        self.personal_page: Optional[Page] = None
+        self.credential_manager = CredentialManager(Config.ENCRYPTION_KEY)
+        self.is_running = False
+        self.logger = self._setup_logger()
+        
+        # Store account sessions
+        self.power_session = None
+        self.personal_session = None
+        
+    def _setup_logger(self):
+        """Setup logging configuration"""
+        # Fix Unicode encoding for Windows
+        import sys
+        if sys.platform == 'win32':
+            try:
+                import codecs
+                # Only apply to console streams, not file streams
+                if hasattr(sys.stdout, 'detach'):
+                    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+                if hasattr(sys.stderr, 'detach'):
+                    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+            except Exception as e:
+                # If encoding setup fails, continue without it
+                pass
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('automation.log', encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        return logging.getLogger(__name__)
+    
+    async def __aenter__(self):
+        """Async context manager entry"""
+        await self.start_browser()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.cleanup()
+    
+    async def start_browser(self):
+        """Start the browser with multiple contexts for separate accounts"""
+        try:
+            self.playwright = await async_playwright().start()
+            
+            # Create separate browser contexts for each account
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,  # Set to True for production
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            
+            # Create separate contexts for each account
+            self.power_context = await self.browser.new_context()
+            self.personal_context = await self.browser.new_context()
+            
+            self.logger.info("Browser started successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to start browser: {e}")
+            return False
+    
+    async def login_account(self, email: str, password: str, account_type: str) -> bool:
+        """Login to a specific account"""
+        try:
+            context = self.power_context if account_type == "power" else self.personal_context
+            page = await context.new_page()
+            
+            # Navigate to login page
+            await page.goto(Config.LOGIN_URL)
+            await page.wait_for_load_state('networkidle')
+            
+            # Fill login form
+            await page.fill('input[name="bus_id"]', email)
+            await page.fill('input[name="password"]', password)
+            
+            # Submit form
+            await page.click('input[type="image"]')
+            
+            # Wait for navigation and check if login successful
+            await page.wait_for_load_state('networkidle')
+            
+            # Check if login was successful (look for logout button or user menu)
+            current_url = page.url
+            if "index.asp" in current_url or "mainpage" in current_url:
+                self.logger.info(f"Successfully logged in to {account_type} account")
+                
+                # Navigate to mylist page after successful login
+                await self.navigate_to_mylist(page, account_type)
+                
+                # Store the page reference
+                if account_type == "power":
+                    self.power_page = page
+                else:
+                    self.personal_page = page
+                
+                return True
+            else:
+                self.logger.error(f"Login failed for {account_type} account")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Login error for {account_type} account: {e}")
+            return False
+    
+    async def navigate_to_mylist(self, page: Page, account_type: str):
+        """Navigate to mylist page and click the 'view all' button"""
+        try:
+            # Navigate to mylist page
+            await page.goto("https://www.musalist.com:442/mainpage/business/member/mylist.asp")
+            await page.wait_for_load_state('networkidle')
+            
+            # Click the "view all" button (다보기)
+            view_all_button = await page.query_selector('a[href="mylist_more.asp?id=busi2"]')
+            if view_all_button:
+                # await view_all_button.click()
+                await page.wait_for_load_state('networkidle')
+                self.logger.info(f"Successfully navigated to mylist page for {account_type} account")
+                
+                # Store the page source as HTML file
+                # await self.save_page_source(page, account_type)
+                
+                # Process edit buttons
+                await self.process_edit_buttons(page, account_type)
+            else:
+                self.logger.warning(f"Could not find 'view all' button for {account_type} account")
+                
+        except Exception as e:
+            self.logger.error(f"Error navigating to mylist page for {account_type} account: {e}")
+    
+    async def process_edit_buttons(self, page: Page, account_type: str):
+        """Find all edit buttons and navigate to the first edit page, save page source, and wait"""
+        try:
+            # Find all edit buttons (based on the provided HTML, using the image's onclick attribute)
+            edit_buttons = await page.query_selector_all("img[alt='수정'][onclick*='cars_edit.asp']")
+            
+            self.logger.info(f"Found {len(edit_buttons)} edit buttons for {account_type} account")
+            
+            # Store the main page URL
+            main_url = page.url
+            
+            # Process only the first edit button
+            if edit_buttons:
+                button = edit_buttons[0]  # Get only the first button
+                index = 0  # Set index to 0 for the first button
+                try:
+                    self.logger.info(f"Processing edit button {index + 1} for {account_type} account")
+                    
+                    # Get the onclick attribute
+                    onclick_value = await button.get_attribute("onclick")
+                    if onclick_value:
+                        # Extract the URL from the onclick (e.g., location.href='URL')
+                        # Split by single quotes and get the URL part
+                        url_parts = onclick_value.split("'")
+                        if len(url_parts) >= 2:
+                            edit_url = url_parts[1]  # Extract the URL between the quotes
+                            # Format the URL with the base URL
+                            formatted_url = f"https://www.musalist.com:442{edit_url}"
+                            self.logger.info(f"Navigating to edit URL: {formatted_url}")
+                            
+                            # Store the current edit URL for AD_IDX extraction
+                            self.current_edit_url = formatted_url
+                            
+                            # Navigate to the edit page
+                            await page.goto(formatted_url)
+
+                            await page.wait_for_load_state('networkidle')
+                            
+                            # Wait for the edit page to load
+                            await asyncio.sleep(2)
+                            
+                            # Save the edit page source
+                            await self.save_edit_page_source(page, account_type, index + 1)
+                            time.sleep(5)
+                            
+                            # Wait for 5 seconds as requested
+                            self.logger.info(f"Waiting 5 seconds after saving edit page {index + 1}")
+                            await asyncio.sleep(5)
+                            
+                            # Navigate back to the main page
+                            await page.goto(main_url)
+                            await page.wait_for_load_state('networkidle')
+                            
+                            # Wait for the main page to reload and stabilize
+                            await asyncio.sleep(2)
+                            
+                            self.logger.info(f"Successfully processed edit button {index + 1} for {account_type} account")
+                            
+                            # Delete the old listing first
+                            if hasattr(self, 'current_ad_idx') and self.current_ad_idx:
+                                try:
+                                    await self.delete_listing_by_idx(account_type, self.current_ad_idx)
+                                    # Clear the stored ad_idx
+                                    delattr(self, 'current_ad_idx')
+                                except Exception as e:
+                                    self.logger.error(f"Error deleting old listing: {e}")
+                            
+                            # Now create a new post using the extracted data (LAST STEP)
+                            if hasattr(self, 'current_excel_filename') and self.current_excel_filename:
+                                await self.create_new_post_from_extracted_data(account_type, index + 1, self.current_excel_filename)
+                                # Clear the stored filename
+                                delattr(self, 'current_excel_filename')
+                            else:
+                                self.logger.warning("No Excel filename available for posting")
+                        
+                        
+                        else:
+                            self.logger.warning(f"Could not extract URL from onclick: {onclick_value}")
+                    else:
+                        self.logger.warning(f"No onclick attribute found for edit button {index + 1}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error processing edit button {index + 1} for {account_type} account: {e}")
+            else:
+                self.logger.info(f"No edit buttons found for {account_type} account")
+                    
+        except Exception as e:
+            self.logger.error(f"Error processing edit buttons for {account_type} account: {e}")
+    
+    async def save_edit_page_source(self, page: Page, account_type: str, button_index: int):
+        """Save the edit page source as HTML file"""
+        try:
+            # Get the page source
+            page_source = await page.content()
+            
+            # Create filename with timestamp and button index
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{account_type.upper()}_EDIT_PAGE_{button_index}_{timestamp}.html"
+            
+            # Save to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(page_source)
+            
+            self.logger.info(f"Edit page source saved as {filename} for {account_type} account, button {button_index}")
+            
+            # Extract data from the edit page and save to Excel
+            excel_filename = await self.extract_edit_page_data(filename, account_type, button_index)
+            print("Extracted data from edit page and saved to Excel")
+            time.sleep(5)
+            
+            # Store the Excel filename for use in posting
+            self.current_excel_filename = excel_filename
+            
+        except Exception as e:
+            self.logger.error(f"Error saving edit page source for {account_type} account, button {button_index}: {e}")
+    
+    async def extract_edit_page_data(self, html_filename: str, account_type: str, button_index: int):
+        """Extract data from edit page HTML and save to Excel"""
+        try:
+            import os
+            import pandas as pd
+            import requests
+            import uuid
+            import re
+            from bs4 import BeautifulSoup
+            
+            # Extract AD_IDX from the filename or URL
+            ad_idx = ''
+            # Try to extract from the page URL if available
+            if hasattr(self, 'current_edit_url'):
+                match = re.search(r'idx=(\d+)', self.current_edit_url)
+                if match:
+                    ad_idx = match.group(1)
+            
+            # Create images folder if it doesn't exist
+            images_folder = "images"
+            if not os.path.exists(images_folder):
+                os.makedirs(images_folder)
+                self.logger.info(f"Created images folder: {images_folder}")
+            
+            # Read the HTML file content
+            with open(html_filename, 'r', encoding='utf-8') as file:
+                soup = BeautifulSoup(file, 'html.parser')
+            
+            # Extract title
+            title_element = soup.find('input', {'name': 'txtTitle'})
+            title = title_element['value'] if title_element else ''
+            
+            # Extract author and account type
+            author = ''
+            account_type_from_page = ''
+            name_img = soup.find('img', {'alt': '이름'})
+            if name_img:
+                name_td = name_img.find_parent('td').find_next_sibling('td', {'class': 'default_14', 'style': 'padding-left:30px;'})
+                if name_td:
+                    author = name_td.get_text(strip=True).replace('파워딜러', '').strip()
+                    account_type_element = name_td.find('span', {'class': 'dealer_nu'})
+                    if account_type_element:
+                        account_type_from_page = account_type_element.get_text(strip=True)
+            
+            # Extract location (state and city)
+            state = ''
+            city = ''
+            state_element = soup.find('select', {'name': 'state'})
+            if state_element:
+                selected_option = state_element.find('option', selected=True)
+                if selected_option:
+                    state = selected_option.get_text(strip=True)
+            
+            city_element = soup.find('input', {'name': 'city'})
+            if city_element:
+                city = city_element['value']
+            
+            location = f"{city}, {state}" if city and state else ''
+            
+            # Extract year
+            year_element = soup.find('input', {'name': 'vyear'})
+            year = year_element['value'] if year_element else ''
+            
+            # Extract price
+            price_element = soup.find('input', {'name': 'txtPrice'})
+            price = price_element['value'] if price_element else ''
+            
+            # Extract mileage
+            mileage_element = soup.find('input', {'name': 'mileage'})
+            mileage = mileage_element['value'] if mileage_element else ''
+            
+            # Get current date
+            date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Extract description and clean it
+            description = ''
+            description_element = soup.find('textarea', {'name': 'txtText'})
+            if description_element:
+                description_raw = description_element.get_text(strip=True)
+                description_soup = BeautifulSoup(description_raw, 'html.parser')
+                description = description_soup.get_text(separator=" ", strip=True).replace('\xa0', ' ')
+            
+            # Extract image URL and download image
+            image_url = ''
+            image_local_path = ''
+            image_path_element = soup.find('input', {'name': 'oimgname', 'value': lambda x: x and x != ''})
+            if image_path_element:
+                image_path = image_path_element['value']
+                if image_path:
+                    image_url = f"https://www.musalist.com:442{image_path}"
+                    
+                    # Download image
+                    try:
+                        image_filename = image_path.split('/')[-1]
+                        image_local_path = os.path.join(images_folder, f"{uuid.uuid4()}_{image_filename}")
+                        response = requests.get(image_url, timeout=30)
+                        if response.status_code == 200:
+                            with open(image_local_path, 'wb') as f:
+                                f.write(response.content)
+                            self.logger.info(f"Downloaded image: {image_local_path}")
+                        else:
+                            image_local_path = "Failed to download"
+                    except Exception as e:
+                        self.logger.warning(f"Failed to download image {image_url}: {e}")
+                        image_local_path = "Failed to download"
+            
+            # Prepare data for Excel
+            data = {
+                'Title': [title],
+                'Location': [location],
+                'Mileage': [mileage],
+                'Year': [year],
+                'Author': [author],
+                'Price': [price],
+                'Date': [date],
+                'Description': [description],
+                'Image_URL': [image_url],
+                'Local_Image_Path': [image_local_path],
+                'Account_Type': [account_type_from_page or account_type.upper()],
+                'Ad_IDX': [ad_idx]
+            }
+            
+            # Create DataFrame and save to Excel
+            df = pd.DataFrame(data)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            excel_filename = f"{account_type.upper()}_EDIT_DATA_{button_index}_{timestamp}.xlsx"
+            df.to_excel(excel_filename, index=False)
+            
+            self.logger.info(f"Edit page data extracted and saved to {excel_filename} for {account_type} account, button {button_index}")
+            time.sleep(5)
+            
+            # Store the ad_idx for later deletion
+            self.current_ad_idx = df['Ad_IDX'][0]
+            
+            # Return the filename for use in posting
+            return excel_filename
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting edit page data for {account_type} account, button {button_index}: {e}")
+    
+    async def create_new_post_from_extracted_data(self, account_type: str, button_index: int, excel_filename: str):
+        """Create a new post using the extracted data from the edit page"""
+        try:
+            import pandas as pd
+            import os
+            import random
+            import time
+
+            
+            # Fix Unicode encoding for logging
+            import sys
+            if sys.platform == 'win32':
+                try:
+                    import codecs
+                    # Only apply to console streams, not file streams
+                    if hasattr(sys.stdout, 'detach'):
+                        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+                    if hasattr(sys.stderr, 'detach'):
+                        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+                except Exception as e:
+                    # If encoding setup fails, continue without it
+                    pass
+            
+            # Use the provided Excel filename directly
+            if not os.path.exists(excel_filename):
+                self.logger.warning(f"Excel file not found: {excel_filename}")
+                return
+            
+            self.logger.info(f"Using data from {excel_filename}")
+            
+            # Read the data
+            df = pd.read_excel(excel_filename)
+            if len(df) == 0:
+                self.logger.warning(f"Excel file {excel_filename} is empty")
+                return
+            
+            # Get the first row data
+            row = df.iloc[0]
+            title = row.get('Title', 'N/A')
+            location = row.get('Location', 'N/A')
+            mileage = row.get('Mileage', 'N/A')
+            year = row.get('Year', 'N/A')
+            price = row.get('Price', 'N/A')
+            image_path = row.get('Local_Image_Path', 'N/A')
+            description = row.get('Description', 'N/A')
+            
+            self.logger.info(f"Creating new post with title: {title[:50]}...")
+            
+            # Select context based on account type
+            context = self.power_context if account_type == "power" else self.personal_context
+            
+            # Create a new tab in the existing context
+            page = await context.new_page()
+            
+            try:
+                # Navigate to the posting form in the new tab
+                await page.goto("https://www.musalist.com:442/mainpage/business/cars/cars_write.asp?id=busi2")
+                await page.wait_for_load_state('networkidle')
+                await asyncio.sleep(2)
+                
+                self.logger.info(f"Opened new tab for posting form: {page.url}")
+                
+                # Fill form fields with human-like delays
+                await self.fill_form_field_with_delay(page, 'input[name="txtTitle"]', title)
+                
+                # Parse and fill location
+                if location != 'N/A':
+                    await self.fill_location_fields(page, location)
+                
+                # Fill year
+                if year != 'N/A':
+                    year_clean = str(year).replace("년식", "")
+                    await self.fill_form_field_with_delay(page, 'input[name="vyear"]', year_clean)
+                
+                # Fill price
+                if price != 'N/A':
+                    price_clean = str(price).replace("$", "")
+                    await self.fill_form_field_with_delay(page, 'input[name="txtPrice"]', price_clean)
+                
+                # Fill mileage
+                if mileage != 'N/A':
+                    mileage_clean = str(mileage).replace("Miles", "")
+                    await self.fill_form_field_with_delay(page, 'input[name="mileage"]', mileage_clean)
+                
+                # Fill car kind (default value)
+                await self.fill_select_field_with_delay(page, 'select[name="carkind"]', "Sedans")
+                
+                # Upload image
+                if image_path != 'N/A' and os.path.exists(image_path):
+                    await self.upload_image(page, image_path)
+                else:
+                    # Use default image if the original image doesn't exist
+                    default_image_path = "default.jpg"
+                    if os.path.exists(default_image_path):
+                        await self.upload_image(page, default_image_path)
+                        self.logger.info("Using default.jpg for image upload")
+                    else:
+                        self.logger.warning("No image available for upload - neither original nor default.jpg exists")
+                
+                # Fill description in iframe
+                if description != 'N/A':
+                    await self.fill_description_in_iframe(page, description)
+                
+                # Submit the form
+                await self.submit_form(page)
+                
+                self.logger.info(f"Successfully created new post for {account_type} account")
+                
+            finally:
+                # Always close the posting page
+                if not page.is_closed():
+                    await page.close()
+            
+        except Exception as e:
+            self.logger.error(f"Error creating new post for {account_type} account: {e}")
+            # Try to close the page even if there was an error
+            try:
+                await page.close()
+            except:
+                pass
+    
+    async def fill_form_field_with_delay(self, page, selector: str, value: str):
+        """Fill a form field with human-like delays"""
+        try:
+            import random
+            element = await page.query_selector(selector)
+            if element:
+                await element.scroll_into_view_if_needed()
+                await asyncio.sleep(random.uniform(1.5, 2.5))
+                
+                await element.fill("")
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                
+                # Type like a human
+                for char in str(value):
+                    await element.type(char)
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
+                
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                self.logger.info(f"Filled field {selector} with {value[:30]}...")
+        except Exception as e:
+            self.logger.warning(f"Error filling field {selector}: {e}")
+    
+    async def fill_select_field_with_delay(self, page, selector: str, value: str):
+        """Fill a select field with human-like delays"""
+        try:
+            import random
+            await page.select_option(selector, value)
+            await asyncio.sleep(random.uniform(1, 2))
+            self.logger.info(f"Selected {value} in {selector}")
+        except Exception as e:
+            self.logger.warning(f"Error selecting {value} in {selector}: {e}")
+    
+    async def fill_location_fields(self, page, location: str):
+        """Parse and fill location fields"""
+        try:
+            if "," in location:
+                parts = location.split(", ")
+                if len(parts) == 2:
+                    city = parts[0].strip()
+                    state_full_name = parts[1].strip()
+                else:
+                    city = location
+                    state_full_name = "California"
+            elif " / " in location:
+                city, state_abbr = location.strip("[]").split(" / ")
+                state_mapping = {
+                    "AK": "Alaska", "AL": "Alabama", "AR": "Arkansas", "AZ": "Arizona",
+                    "CA": "California", "CO": "Colorado", "CT": "Connecticut",
+                    "DC": "District of Columbia", "DE": "Delaware", "FL": "Florida",
+                    "GA": "Georgia", "HI": "Hawaii", "IA": "Iowa", "ID": "Idaho",
+                    "IL": "Illinois", "IN": "Indiana", "KS": "Kansas", "KY": "Kentucky",
+                    "LA": "Louisiana", "MA": "Massachusetts", "MD": "Maryland",
+                    "ME": "Maine", "MI": "Michigan", "MN": "Minnesota", "MO": "Missouri",
+                    "MS": "Mississippi", "MT": "Montana", "NC": "North Carolina",
+                    "ND": "North Dakota", "NE": "Nebraska", "NH": "New Hampshire",
+                    "NJ": "New Jersey", "NM": "New Mexico", "NV": "Nevada",
+                    "NY": "New York", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+                    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+                    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+                    "VA": "Virginia", "VT": "Vermont", "WA": "Washington",
+                    "WI": "Wisconsin", "WV": "West Virginia", "WY": "Wyoming"
+                }
+                state_full_name = state_mapping.get(state_abbr, state_abbr)
+            else:
+                city = location
+                state_full_name = "California"
+            
+            await self.fill_select_field_with_delay(page, 'select[name="state"]', state_full_name)
+            await self.fill_form_field_with_delay(page, 'input[name="city"]', city)
+            
+        except Exception as e:
+            self.logger.warning(f"Error filling location fields: {e}")
+    
+    async def upload_image(self, page, image_path: str):
+        """Upload image to the form"""
+        try:
+            image_input = await page.query_selector('#txtAttachImage1')
+            if image_input:
+                await image_input.scroll_into_view_if_needed()
+                await asyncio.sleep(1)
+                
+                absolute_image_path = os.path.abspath(image_path)
+                await image_input.set_input_files(absolute_image_path)
+                await asyncio.sleep(1)
+                
+                self.logger.info(f"Uploaded image: {absolute_image_path}")
+        except Exception as e:
+            self.logger.warning(f"Error uploading image: {e}")
+    
+    async def fill_description_in_iframe(self, page, description: str):
+        """Fill description in the iframe editor"""
+        try:
+            import random
+            # Switch to iframe
+            iframe = await page.query_selector('#editCtrl')
+            if iframe:
+                frame = await iframe.content_frame()
+                body = await frame.query_selector('body')
+                
+                if body:
+                    await body.click()
+                    await asyncio.sleep(random.uniform(0.5, 1))
+                    
+                    # Clear existing content
+                    await body.fill("")
+                    await asyncio.sleep(random.uniform(1, 2))
+                    
+                    # Type description character by character
+                    for char in description:
+                        await body.type(char)
+                        await asyncio.sleep(random.uniform(0.01, 0.03))
+                    
+                    self.logger.info("Description filled in iframe")
+
+
+                
+                # Switch back to main document
+                await page.bring_to_front()
+                await asyncio.sleep(random.uniform(2, 3))
+                
+        except Exception as e:
+            self.logger.warning(f"Error filling description in iframe: {e}")
+    
+    async def submit_form(self, page):
+        """Submit the form"""
+        try:
+            # Find submit button
+            submit_button = await page.query_selector('img[alt="등록하기"]')
+            if submit_button:
+                await submit_button.scroll_into_view_if_needed()
+                await asyncio.sleep(3)
+                
+                # Click the submit button directly
+                await submit_button.click()
+                await asyncio.sleep(3)
+                
+                self.logger.info("Form submitted successfully")
+                
+                # Check for errors
+                current_url = page.url
+                if "error" in current_url.lower() or "500" in current_url:
+                    self.logger.warning("Possible server error detected")
+                    
+            else:
+                self.logger.warning("Submit button not found")
+                
+        except Exception as e:
+            self.logger.error(f"Error submitting form: {e}")
+    
+    async def save_page_source(self, page: Page, account_type: str):
+        """Save the page source as HTML file for the respective account"""
+        try:
+            # Get the page source
+            page_source = await page.content()
+            
+            # Create filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{account_type.upper()}_ACCOUNT_{timestamp}.html"
+            
+            # Save to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(page_source)
+            
+            self.logger.info(f"Page source saved as {filename} for {account_type} account")
+            
+            # Extract data and save to Excel
+            await self.extract_and_save_to_excel(filename, account_type)
+            
+        except Exception as e:
+            self.logger.error(f"Error saving page source for {account_type} account: {e}")
+    
+    async def extract_and_save_to_excel(self, html_filename: str, account_type: str):
+        """Extract advertisement data from HTML and save to Excel, then delete the first ad."""
+        try:
+            from bs4 import BeautifulSoup
+            import pandas as pd
+            import urllib.parse
+            import os
+            import requests
+            from PIL import Image
+            import io
+            
+            # Create Image folder if it doesn't exist
+            image_folder = "Image"
+            if not os.path.exists(image_folder):
+                os.makedirs(image_folder)
+                self.logger.info(f"Created Image folder: {image_folder}")
+            
+            BASE_URL = "https://www.musalist.com:442"
+            with open(html_filename, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            soup = BeautifulSoup(html_content, 'html.parser')
+            data = {
+                'Title': [],
+                'Location': [],
+                'Mileage': [],
+                'Year': [],
+                'Author': [],
+                'Price': [],
+                'Date': [],
+                'Description': [],
+                'Image_URL': [],
+                'Local_Image_Path': [],
+                'Account_Type': [],
+                'Ad_IDX': [],
+            }
+            rows = soup.find_all('tr')[1:]
+            max_ads = 5 if account_type == "power" else 1
+            processed_count = 0
+            
+            for index, row in enumerate(rows):
+                if processed_count >= max_ads:
+                    break
+                try:
+                    vehicle_info_td = row.find('td', bgcolor="#ffffff")
+                    if not vehicle_info_td:
+                        continue
+                    vehicle_info = vehicle_info_td.find('table')
+                    if not vehicle_info:
+                        continue
+                    img_tag = vehicle_info.find('img')
+                    img_src = img_tag['src'] if img_tag and 'src' in img_tag.attrs else 'N/A'
+                    if img_src != 'N/A' and not img_src.startswith('http'):
+                        img_url = urllib.parse.urljoin(BASE_URL, img_src)
+                    else:
+                        img_url = img_src
+                    
+                    # Download image and save locally
+                    local_image_path = 'N/A'
+                    if img_url != 'N/A':
+                        try:
+                            # Generate unique filename based on account type and index
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            image_filename = f"{account_type}_{processed_count}_{timestamp}.jpg"
+                            local_image_path = os.path.join(image_folder, image_filename)
+                            
+                            # Download image
+                            response = requests.get(img_url, timeout=30)
+                            response.raise_for_status()
+                            
+                            # Convert to JPEG and save
+                            img = Image.open(io.BytesIO(response.content))
+                            img = img.convert('RGB')  # Convert to RGB if needed
+                            img.save(local_image_path, 'JPEG', quality=85)
+                            
+                            self.logger.info(f"Downloaded image: {local_image_path}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to download image {img_url}: {e}")
+                            local_image_path = 'N/A'
+                    
+                    location_span = vehicle_info.find('span', class_='sell_catagory')
+                    location = location_span.text.strip() if location_span else 'N/A'
+                    title_div = vehicle_info.find('div', class_='sell_title')
+                    if title_div:
+                        title_link = title_div.find('a')
+                        title = title_link.text.strip() if title_link else 'N/A'
+                        # Extract ad idx from href
+                        ad_idx = None
+                        if title_link and 'href' in title_link.attrs:
+                            import re
+                            m = re.search(r'idx=(\d+)', title_link['href'])
+                            if m:
+                                ad_idx = m.group(1)
+                    else:
+                        title = 'N/A'
+                        ad_idx = None
+                    dealer_info_div = vehicle_info.find('div', class_='dealerlist')
+                    dealer_info = dealer_info_div.text.strip() if dealer_info_div else 'N/A / N/A'
+                    mileage, year = dealer_info.split(' / ') if ' / ' in dealer_info else ('N/A', 'N/A')
+                    author_td = row.find('td', align="center")
+                    author = 'N/A'
+                    if author_td:
+                        author_div = author_td.find('div', class_='sell_catagory')
+                        if author_div:
+                            author_text = author_div.text.strip()
+                            author = author_text.split('\n')[0] if '\n' in author_text else author_text
+                    price_td = row.find('td', class_='price')
+                    price = price_td.text.strip() if price_td else 'N/A'
+                    date_td = row.find('td', class_='note_date')
+                    date = date_td.text.strip() if date_td else 'N/A'
+                    
+                    # Extract description from the vehicle info
+                    description = 'N/A'
+                    description_div = vehicle_info.find('div', class_='sell_content')
+                    if description_div:
+                        description_text = description_div.text.strip()
+                        # Clean up the description text
+                        description = description_text.replace('\n', ' ').replace('\r', ' ').strip()
+                        if not description:
+                            description = 'N/A'
+                    
+                    data['Title'].append(title)
+                    data['Location'].append(location)
+                    data['Mileage'].append(mileage)
+                    data['Year'].append(year)
+                    data['Author'].append(author)
+                    data['Price'].append(price)
+                    data['Date'].append(date)
+                    data['Description'].append(description)
+                    data['Image_URL'].append(img_url)
+                    data['Local_Image_Path'].append(local_image_path)
+                    data['Account_Type'].append(account_type.upper())
+                    data['Ad_IDX'].append(ad_idx)
+                    processed_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Error processing row {index + 1}: {e}")
+                    continue
+            import pandas as pd
+            df = pd.DataFrame(data)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            excel_filename = f"AD_LISTINGS_{timestamp}.xlsx"
+            df.to_excel(excel_filename, index=False)
+            self.logger.info(f"Extracted {len(df)} ads from {account_type} account and saved to {excel_filename}")
+            self.logger.info(f"Images saved in folder: {image_folder}")
+            # After saving, delete the first ad if possible
+            if len(df) > 0 and df['Ad_IDX'][0]:
+                await self.delete_listing_by_idx(account_type, df['Ad_IDX'][0])
+        except Exception as e:
+            self.logger.error(f"Error extracting data to Excel for {account_type} account: {e}")
+
+    async def delete_listing_by_idx(self, account_type: str, ad_idx: str):
+        """Delete a listing by its idx, handling JS alerts, using a new page from the context."""
+        page = None
+        try:
+            # Select context based on account type
+            context = self.power_context if account_type == "power" else self.personal_context
+            
+            # Check if context is still valid (try to create a test page)
+            try:
+                test_page = await context.new_page()
+                await test_page.close()
+            except Exception as context_error:
+                self.logger.error(f"Browser context for {account_type} account is not accessible: {context_error}")
+                return
+            
+            page = await context.new_page()
+            
+            try:
+                await page.goto("https://www.musalist.com:442/mainpage/business/member/mylist.asp")
+                await page.wait_for_load_state('networkidle')
+                await asyncio.sleep(2)  # Wait for page stabilization
+                self.logger.info("Page loaded and stabilized")
+                print("Page loaded and stabilized")
+
+                # Define delete button selector
+                delete_img_selector = f"img[alt='삭제'][onclick*=\"del('{ad_idx}',\"]"
+                delete_img = await page.query_selector(delete_img_selector)
+
+                if delete_img:
+                    await delete_img.scroll_into_view_if_needed()
+                    self.logger.info(f"Found delete button for idx={ad_idx}, clicking...")
+                    print("Delete button found and scrolled into view")
+
+                    # Set up dialog handler for both alerts
+                    dialogs_captured = []
+
+                    async def handle_dialog(dialog):
+                        dialogs_captured.append(dialog)
+                        self.logger.info(f"Dialog appeared: {dialog.message}")
+                        print(f"Dialog captured: {dialog.message}")
+                        await asyncio.sleep(1)  # Small delay before accepting
+                        await dialog.accept()
+                        print("Dialog accepted")
+
+                    page.on("dialog", handle_dialog)
+
+                    # Click delete button
+                    await delete_img.click()
+                    self.logger.info("Delete button clicked")
+                    print("Delete button clicked")
+
+                    # Wait up to 5 seconds for the first alert
+                    start_time = asyncio.get_event_loop().time()
+                    while len(dialogs_captured) < 1 and (asyncio.get_event_loop().time() - start_time) < 5:
+                        await asyncio.sleep(0.5)  # Poll every 0.5 seconds
+
+                    if len(dialogs_captured) < 1:
+                        self.logger.warning("First confirmation dialog not captured within 5 seconds")
+                        print("First confirmation dialog not captured")
+                        raise Exception("Failed to capture first confirmation dialog")
+
+                    # Wait up to 5 seconds for the second alert
+                    start_time = asyncio.get_event_loop().time()
+                    while len(dialogs_captured) < 2 and (asyncio.get_event_loop().time() - start_time) < 5:
+                        await asyncio.sleep(0.5)  # Poll every 0.5 seconds
+
+                    if len(dialogs_captured) < 2:
+                        self.logger.warning("Second success dialog not captured within 5 seconds")
+                        print("Second success dialog not captured")
+                        raise Exception("Failed to capture second success dialog")
+
+                    self.logger.info(f"Deleted listing idx={ad_idx} for {account_type} account.")
+                    print("Deletion completed")
+
+                else:
+                    self.logger.warning(
+                        f"Delete button not found for ad idx={ad_idx} on {account_type} account using selector: {delete_img_selector}"
+                    )
+                    print("Delete button not found")
+                    raise Exception("Delete button not found")
+
+            except Exception as e:
+                self.logger.error(f"Error deleting listing idx={ad_idx} for {account_type} account: {e}")
+                print(f"Error occurred: {e}")
+                raise  # Re-raise the exception to be caught by outer try block
+                
+        except Exception as e:
+            self.logger.error(f"Error in delete_listing_by_idx for {account_type} account: {e}")
+            print(f"Error occurred: {e}")
+        finally:
+            # Always try to close the page safely
+            if page and not page.is_closed():
+                try:
+                    await page.close()
+                    print("Page closed safely")
+                except Exception as close_error:
+                    self.logger.warning(f"Error closing page: {close_error}")
+                    print("Error closing page")
+
+    async def login_both_accounts(self) -> bool:
+        """Login to both Power Listings and Personal Listings accounts"""
+        try:
+            # Login to Power Listings account
+            power_success = await self.login_account(
+                Config.POWER_LISTINGS_EMAIL,
+                Config.POWER_LISTINGS_PASSWORD,
+                "power"
+            )
+            
+            # Login to Personal Listings account
+            personal_success = await self.login_account(
+                Config.PERSONAL_LISTINGS_EMAIL,
+                Config.PERSONAL_LISTINGS_PASSWORD,
+                "personal"
+            )
+            
+            if power_success and personal_success:
+                self.logger.info("Successfully logged in to both accounts")
+                return True
+            else:
+                self.logger.error("Failed to login to one or both accounts")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error during dual login: {e}")
+            return False
+    
+    async def detect_competitor_ads(self, page: Page) -> List[Dict]:
+        """Detect competitor advertisements on the page"""
+        try:
+            competitor_ads = []
+            
+            # Look for advertisement elements (this will need to be customized based on the actual website structure)
+            ad_elements = await page.query_selector_all('.advertisement, .listing, .post')
+            
+            for element in ad_elements:
+                try:
+                    # Extract ad content
+                    content = await element.text_content()
+                    if content:
+                        # Check if content contains competitor keywords
+                        content_lower = content.lower()
+                        is_competitor = any(keyword in content_lower for keyword in Config.COMPETITOR_KEYWORDS)
+                        
+                        if is_competitor:
+                            # Extract ad details
+                            ad_info = {
+                                'element': element,
+                                'content': content,
+                                'timestamp': datetime.now().isoformat(),
+                                'is_competitor': True
+                            }
+                            competitor_ads.append(ad_info)
+                            
+                except Exception as e:
+                    self.logger.warning(f"Error processing ad element: {e}")
+                    continue
+            
+            self.logger.info(f"Detected {len(competitor_ads)} competitor advertisements")
+            return competitor_ads
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting competitor ads: {e}")
+            return []
+    
+    async def delete_existing_ads(self, page: Page, account_type: str, max_ads: int) -> int:
+        """Delete existing advertisements"""
+        try:
+            deleted_count = 0
+            
+            # Find delete buttons or links for existing ads
+            delete_buttons = await page.query_selector_all('.delete-btn, .remove-btn, [data-action="delete"]')
+            
+            for button in delete_buttons[:max_ads]:
+                try:
+                    await button.click()
+                    
+                    # Handle confirmation dialog if present
+                    try:
+                        confirm_button = await page.wait_for_selector('.confirm-delete, .yes-btn', timeout=3000)
+                        if confirm_button:
+                            await confirm_button.click()
+                    except:
+                        pass  # No confirmation dialog
+                    
+                    await page.wait_for_timeout(1000)  # Wait for deletion to complete
+                    deleted_count += 1
+                    
+                except Exception as e:
+                    self.logger.warning(f"Error deleting ad: {e}")
+                    continue
+            
+            self.logger.info(f"Deleted {deleted_count} advertisements for {account_type} account")
+            return deleted_count
+            
+        except Exception as e:
+            self.logger.error(f"Error deleting existing ads: {e}")
+            return 0
+    
+    async def create_new_ad(self, page: Page, account_type: str, ad_data: Dict) -> bool:
+        """Create a new advertisement"""
+        try:
+            # Navigate to ad creation page
+            await page.goto(f"{Config.MAIN_PAGE_URL}/create-ad")
+            await page.wait_for_load_state('networkidle')
+            
+            # Fill in ad details
+            await page.fill('input[name="title"]', ad_data.get('title', ''))
+            await page.fill('textarea[name="content"]', ad_data.get('content', ''))
+            await page.fill('input[name="price"]', ad_data.get('price', ''))
+            
+            # Upload image if provided
+            if ad_data.get('image_path'):
+                file_input = await page.query_selector('input[type="file"]')
+                if file_input:
+                    await file_input.set_input_files(ad_data['image_path'])
+            
+            # Submit the form
+            await page.click('button[type="submit"], input[type="submit"]')
+            await page.wait_for_load_state('networkidle')
+            
+            self.logger.info(f"Successfully created new advertisement for {account_type} account")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error creating new advertisement: {e}")
+            return False
+    
+
+    async def run_with_context(self):
+        """Run automation with proper async context management"""
+        async with self:
+            try:
+                if not await self.login_both_accounts():
+                    return False
+
+                    
+                return True
+            except Exception as e:
+                self.logger.error(f"Automation error: {e}")
+                return False
+    
+    async def start_automation(self):
+        """Start the continuous automation process"""
+        self.is_running = True
+        self.logger.info("Starting automation process")
+        
+        try:
+            # Use the new context management approach
+            return await self.run_with_context()
+        except Exception as e:
+            self.logger.error(f"Automation error: {e}")
+            return False
+    
+    async def stop_automation(self):
+        """Stop the automation process"""
+        self.is_running = False
+        self.logger.info("Stopping automation process")
+    
+    async def cleanup(self):
+        """Clean up resources"""
+        try:
+            # Close pages first
+            if self.power_page and not self.power_page.is_closed():
+                await self.power_page.close()
+            if self.personal_page and not self.personal_page.is_closed():
+                await self.personal_page.close()
+            
+            # Close contexts
+            if hasattr(self, 'power_context') and self.power_context:
+                await self.power_context.close()
+            if hasattr(self, 'personal_context') and self.personal_context:
+                await self.personal_context.close()
+            
+            # Close browser
+            if self.browser:
+                await self.browser.close()
+            
+            # Stop playwright
+            if hasattr(self, 'playwright'):
+                await self.playwright.stop()
+                
+            self.logger.info("Cleanup completed")
+        except Exception as e:
+            self.logger.error(f"Cleanup error: {e}")
+    
+    def get_status(self) -> Dict:
+        """Get current automation status"""
+        return {
+            'is_running': self.is_running,
+            'power_logged_in': self.power_page is not None,
+            'personal_logged_in': self.personal_page is not None,
+            'timestamp': datetime.now().isoformat()
+        } 
